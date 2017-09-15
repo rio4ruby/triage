@@ -1,0 +1,248 @@
+#!/usr/bin/env ruby
+require 'optparse'
+require 'ostruct'
+require 'net/ssh'
+require 'rio'
+
+# Usage: triage -h hosts -c command [-c command]
+#
+# Requires
+#   gem install net-ssh
+#   gem install rio
+#
+# Run multiple commands on multiple hosts simultaneosly.
+# Hosts must be defined in your .ssh/config file as in:
+#
+#   Host server1
+#        HostName rails1.com
+#        Port 22
+#        User fred
+#   Host server2
+#        HostName rails2.com
+#        Port 7822
+#        User betty
+#
+# Use case:
+#
+# Typically in a production environment several servers are running,
+# any one of which may handle a particular request. triage allows
+# one to perform the same action on all simultaneously, rather than
+# opening seperate windows for each.
+#
+# With multiple rails servers, one can follow the logs of all simultaneously
+#
+# ./triage -h server1,server2 -c 'tail -f /railsapp/log/production.log'
+#
+# Or search all simultaneously
+#
+# ./triage -h server1,server2 -c 'grep whatIamLookingFor /railsapp/log/production.log'
+#
+
+# Parse the .ssh/config file
+class SshHosts
+  attr_reader :file
+  def initialize(filename = nil)
+    filename ||= rio(ENV['HOME'], '.ssh', 'config')
+    @file = rio(filename)
+  end
+
+  def hosts
+    @hosts ||= parse
+  end
+
+  def user(host)
+    hosts[host]
+  end
+
+  def parse
+    return @hmap if @hmap
+    @hmap = {}
+    host = nil
+    user = nil
+    file.lines do |ln|
+      k, v = ln.strip.sub(/\s*#.*$/, '').split(/\s+/, 2).map(&:strip)
+      next unless k && v
+      case k
+      when 'Host'
+        @hmap.delete(host) unless @hmap.include?(host)
+        @hmap[v] ||= nil
+        host = v
+      when 'User'
+        if host
+          @hmap[host] = v
+          host = user = nil
+        end
+      end
+    end
+    @hmap
+  end
+
+  def self.[](pfx)
+    new[pfx]
+  end
+
+  def [](pfx)
+    find_hosts(pfx)
+  end
+
+  def find_hosts(pfx)
+    hosts.keys.grep(/^#{pfx}(_?\d)?$/)
+  end
+end
+
+# Runs a single command on the host signed in as the user
+class SSHCmd
+  attr_reader :host, :user
+  def initialize(host, user)
+    @host = host
+    @user = user
+  end
+
+  def ssh
+    @ssh ||= Net::SSH.start(host, user)
+  end
+
+  def dump_data(prefix, data)
+    data.split("\n").each do |line|
+      STDOUT.puts "#{prefix}: #{line}"
+    end
+  end
+
+  def dump_error(prefix, data)
+    data.split("\n").each do |line|
+      STDERR.puts "#{prefix}: ERROR: #{line}"
+    end
+  end
+
+  def host_data(data)
+    dump_data(host, data)
+  end
+
+  def host_error(data)
+    dump_error(host, data)
+  end
+
+  def start(cmd)
+    ssh.open_channel do |chnl|
+      chnl.exec cmd do |ch, success|
+        raise 'could not execute command' unless success
+
+        # "on_data" is called when the process writes something to stdout
+        ch.on_data do |_c, data|
+          host_data(data)
+        end
+
+        # "on_extended_data" is called when the process writes something to stderr
+        ch.on_extended_data do |_c, _type, data|
+          host_error(data)
+        end
+
+        ch.on_close { dump_data(host, 'DONE!') }
+      end
+    end
+  end
+end
+
+# Run all commands on all hosts
+class MCmd
+  def initialize(*hostidents)
+    @hostidents = hostidents.flatten
+    @cmds = []
+    @connections = []
+  end
+
+  def ssh_hosts
+    @ssh_hosts ||= SshHosts.new
+  end
+
+  def hosts
+    unless @hosts
+      @hosts = []
+      @hostidents.each do |hi|
+        @hosts << (ssh_hosts[hi].empty? ? hi : ssh_hosts[hi])
+      end
+      @hosts.flatten!
+    end
+    @hosts
+  end
+
+  # Add a command to the list of commands to be run
+  def <<(cmd)
+    @cmds << cmd
+  end
+
+  def run!
+    # This is the main loop
+    # start each command on each host
+    @cmds.each do |cmd|
+      hosts.each do |host|
+        start_cmd(host, cmd)
+      end
+    end
+
+    # Loop until all connections are done
+    condition = proc { |s| s.busy? }
+    loop do
+      @connections.delete_if { |sshcmd| !sshcmd.ssh.process(0.1, &condition) }
+      break if @connections.empty?
+    end
+  end
+
+  def start_cmd(host, cmd)
+    # puts "#{self.class}##{__method__} (#{host},#{cmd}) user=#{ssh_hosts.user(host)}"
+    @connections << SSHCmd.new(host, ssh_hosts.user(host))
+    @connections.last.start(cmd)
+  rescue SocketError, ArgumentError, Net::SSH::Disconnect => e
+    @connections.pop
+    STDERR.puts("#{host}: ERROR: #{e}")
+  end
+end
+
+class TriageCmdOpts
+  def self.parse(args)
+    # The options specified on the command line will be collected in *options*.
+    # We set default values here.
+    options = OpenStruct.new
+    options.hosts = []
+    options.commands = []
+    opts = OptionParser.new do |opt|
+      opt.banner = 'Usage: tcots-cmd.rb [options]'
+
+      opt.separator ''
+      opt.separator 'Specific options:'
+
+      # Mandatory arguments.
+      opt.on('-h', '--host HOST',
+             'The host, host prefix, or comma separated list of hosts on which to run commands') do |host|
+        options.hosts.push(host.split(',')).flatten!
+      end
+
+      opt.on('-c', '--command COMMAND',
+             'Define COMMAND to be run (may be used more than once') do |command|
+        options.commands << command.strip
+      end
+
+      opt.on_tail('--help', 'Show this message') do
+        puts opt
+        exit
+      end
+    end
+
+    opts.order!(args) do |arg|
+      args = [[arg, args].flatten.join(' ')]
+      opts.terminate('-c')
+    end
+
+    opts.parse!([['-c', args].flatten.join(' ')]) unless args.empty? || args.first == '-c'
+
+    options
+  end # parse()
+end # class TriageCmdOpts
+
+options = TriageCmdOpts.parse(ARGV)
+
+mcmd = MCmd.new(options.hosts)
+options.commands.each do |cmd|
+  mcmd << cmd
+end
+mcmd.run!
